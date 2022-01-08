@@ -49,18 +49,21 @@ class RemoteDesktopClient:
             frame_num, frame_length, step, total_step, data = self._q.get()
             _num = frame_num
             _length = frame_length
-            segments = [None for _ in range(total_step)]
+            segments = [b'' for _ in range(total_step)]
             segments[step - 1] = data
             while True:
                 frame_num, frame_length, step, total_step, data = self._q.get()
                 if frame_num > _num:
                     # 新的一帧过来了,返回上一帧, 如果丢包了，则丢弃这一帧
-                    frame_bytes = b''.join(segments)
-                    if all(segments) and  len(frame_bytes) == _length:
-                        yield frame_num, frame_bytes
-                    else:
+                    if len(segments) == 0 or not all(segments):
                         yield None, None
-                    segments = [None for _ in range(total_step)]
+                    else:
+                        frame_bytes = b''.join(segments)
+                        if len(frame_bytes) == _length:
+                            yield _num, frame_bytes
+                        else:
+                            yield None, None
+                    segments = [b'' for _ in range(total_step)]
                     _num = frame_num
                     _length = frame_length
                 segments[step - 1] = data
