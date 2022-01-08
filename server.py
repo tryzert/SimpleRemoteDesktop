@@ -1,50 +1,68 @@
-import socketserver
+import sys
 import time
+import socketserver
 from threading import Thread, Lock as ThreadLock
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import numpy as np
+import cv2 as cv
 from mss import mss
-# from pynput import keyboard
+import d3dshot
 
-import utils
+from utils import comprese_img
+from config import ServerConfig
 
+
+# 获取配置文件
+_cfg = ServerConfig()
 
 class ImageCache:
-    def __init__(self, max_cache_size=30):
+    def __init__(self):
         """
             图片缓存服务。udp不稳定，方便数据片段重发。
             非线程/进程安全!
+
         """
         self._last_frame_num = 0
-        self.max_cache_size = max_cache_size
+        self.max_cache_size = _cfg.getint("image_cache_size")
         self._cache = []
         self._frames = self._grab_screen()
         self._flag = True
 
     def _grab_screen(self):
+        if sys.platform.lower() == 'win32':
+            d = d3dshot.create(capture_output='numpy', frame_buffer_size=self.max_cache_size)
+            while True:
+                if self._flag:
+                    frame = cv.cvtColor(d.screenshot(), cv.COLOR_RGB2BGR) # rgb
+                    data = comprese_img(frame) 
+                    yield data.tobytes()
+                else:
+                    yield None
         with mss() as cap:
             monitor = cap.monitors[1]
             while True:
                 if self._flag:
-                    frame = cap.grab(monitor)
-                    # frame = tools.to_png(frame.rgb, (monitor['width'], monitor['height']))
-                    # frame = utils.comprese_img(frame)
-                    yield frame.rgb
+                    screen_shot = cap.grab(monitor) # bgra
+                    frame = cv.cvtColor(np.asarray(screen_shot), cv.COLOR_BGRA2BGR)
+                    data = comprese_img(frame)
+                    yield data.tobytes()
                 else:
                     yield None
-    
+
     def frame(self):
         # 抓取一帧图片，更新库存，并返回最新一帧图片，
-        step = utils.FRAME_SEGMENT_SIZE
+        step = _cfg.getint("frame_segment_size")
         data = next(self._frames)
-        if not data:
-            return None, None  
+        if not len(data):
+            return None
         # 图片分成片段, 并进行编号.方便后续查找，以及多线程逐个发送
         segments = [data[idx:idx+step] for idx in range(0, len(data), step)]
         frame_num = int.to_bytes(self._last_frame_num, 4, 'big')
+        frame_length = int.to_bytes(len(data), 4, 'big')
         total_step = int.to_bytes(len(segments), 4, 'big')
         for idx, seg in enumerate(segments):
-            segments[idx] = frame_num + int.to_bytes(idx + 1, 4, 'big') + total_step + seg
+            segments[idx] = frame_num + frame_length + int.to_bytes(idx + 1, 4, 'big') + total_step + seg
         self._cache.append(segments)
         self._last_frame_num += 1
         if len(self._cache) > self.max_cache_size:
@@ -123,6 +141,13 @@ class ClientGroup:
                 if not client:
                     return False
         return True
+    
+    # 踢出超时的连接
+    def kick_timeout(self, addr):
+        with self._lock:
+            for idx, client in enumerate(self._clients):
+                if client and client.is_timeout:
+                    self._clients[idx] = None
 
     def add(self, sock, addr):
         """
@@ -181,10 +206,12 @@ class RequestHandler(socketserver.DatagramRequestHandler):
                 print("  [info] 接入成功! ")
                 CGroup.add(self.socket, self.client_address)
 
+    def finish(self):
+        CGroup.kick_timeout(self.client_address)
 
 
 class RemoteDesktopServer:
-    def __init__(self, port=12345):
+    def __init__(self):
         """
             # 通过 addr 来鉴别不同的请求。最大请求数为3个，即最大允许3个远程客户端连接。
             # 服务端自身常驻 1-3个读线程。每进来一个连接，重新开启 n 个写线程。
@@ -192,6 +219,7 @@ class RemoteDesktopServer:
             # 如果没有，则关闭图片缓存，并关闭空闲的 读/写线程。
             改用系统库，本质是select复用
         """
+        port = _cfg.getint('port')
         self._server = socketserver.ThreadingUDPServer(('', port), RequestHandler)
         self.run()
     
@@ -205,12 +233,8 @@ class RemoteDesktopServer:
 
     def run(self):
         Thread(target=self._server.serve_forever, daemon=True).start()
-        # Thread(target=self._update_frame, daemon=True).start()
         print("Server is running...")
-        # with keyboard.Listener(on_press=lambda key: key != keyboard.Key.esc) as ltr:
-        #     ltr.join()
         self._update_frame()
-
 
 
 if __name__ == "__main__":

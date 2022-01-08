@@ -3,11 +3,14 @@ from time import sleep
 import socket
 from queue import Queue
 
-import utils
-# from pynput import keyboard
 import cv2 as cv
 import numpy as np
 
+from config import ClientConfig
+from utils import decompress_img
+
+
+_cfg = ClientConfig()
 
 class RemoteDesktopClient:
     """
@@ -27,7 +30,7 @@ class RemoteDesktopClient:
         self.sock.sendto(data, self.server_addr)
     
     def _recv_data(self):
-        buf_size = utils.RESPONSE_BUF_SIZE
+        buf_size = _cfg.getint('recv_data_length')
         while True:
             data, addr = self.sock.recvfrom(buf_size)
             if data == b'Server refused!':
@@ -36,25 +39,31 @@ class RemoteDesktopClient:
             if addr != self.server_addr:
                 continue
             frame_num = int.from_bytes(data[:4], 'big')
-            step = int.from_bytes(data[4:8], 'big')
-            total_step = int.from_bytes(data[8:12], 'big')
-            data = data[12:]
-            self._q.put((frame_num, step, total_step, data))
-            # print(frame_num, step, total_step, len(data))
+            frame_length = int.from_bytes(data[4:8], 'big')
+            step = int.from_bytes(data[8:12], 'big')
+            total_step = int.from_bytes(data[12:16], 'big')
+            data = data[16:]
+            self._q.put((frame_num, frame_length, step, total_step, data))
     
     def _merge_img(self):
-        f_num = -1 
-        space_holder = int.to_bytes(0, 50 * 1024, 'big')
-        frames = [space_holder for _ in range(122)]
-        frames[-1] = int.to_bytes(0, 25600, 'big')
-        while True:
-            frame_num, step, total_step, data = self._q.get()
-            if frame_num > f_num:
-                # 合并
-                yield frame_num, b''.join(frames)
-                f_num = frame_num
-            else:
-                frames[step - 1] = data
+            frame_num, frame_length, step, total_step, data = self._q.get()
+            _num = frame_num
+            _length = frame_length
+            segments = [None for _ in range(total_step)]
+            segments[step - 1] = data
+            while True:
+                frame_num, frame_length, step, total_step, data = self._q.get()
+                if frame_num > _num:
+                    # 新的一帧过来了,返回上一帧, 如果丢包了，则丢弃这一帧
+                    frame_bytes = b''.join(segments)
+                    if all(segments) and  len(frame_bytes) == _length:
+                        yield frame_num, frame_bytes
+                    else:
+                        yield None, None
+                    segments = [None for _ in range(total_step)]
+                    _num = frame_num
+                    _length = frame_length
+                segments[step - 1] = data
     
     def _show_img(self):
         frq = cv.getTickFrequency()
@@ -63,12 +72,11 @@ class RemoteDesktopClient:
         while True:
             frame_num, frame = next(self._gen)
             if not frame:
-                continue 
-            
+                continue
             img = np.frombuffer(frame, np.uint8)
+            img = decompress_img(img)
             img = np.reshape(img, (1080, 1920, 3))
             img = cv.resize(img, (int(.45 * 1920), int(.45 * 1080)))
-            img = cv.cvtColor(img, cv.COLOR_RGB2BGR)
             if self.show_frame:
                 img = cv.putText(img, 'Frame: {}'.format(frame_num), (10, 20), cv.FONT_HERSHEY_SIMPLEX, .7, (0,0,255), 2)
             if self.show_fps:
@@ -85,15 +93,13 @@ class RemoteDesktopClient:
             cv.waitKey(1)
 
     def _run(self, recv_thread_num):
-        self._send_data(int.to_bytes(0, utils.REQUEST_BUF_SIZE, 'big'))
+        self._send_data(int.to_bytes(0, _cfg.getint('send_data_length'), 'big'))
         for _ in range(recv_thread_num):
             Thread(target=self._recv_data, daemon=True).start()
         Thread(target=self._show_img, daemon=True).start()
-        # with keyboard.Listener(on_press=lambda x: x != keyboard.Key.space) as ltr:
-        #     ltr.join()
         while True:
             sleep(10)
 
 
 if __name__ == "__main__":
-    RemoteDesktopClient(show_frame=False)
+    RemoteDesktopClient()
